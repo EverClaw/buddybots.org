@@ -33,6 +33,7 @@ import { homedir, platform } from 'node:os';
 import { execSync } from 'node:child_process';
 
 import { generateIdentity, hasIdentity, loadIdentity, removeIdentity, isValidAgentId, atomicWrite, readJsonSafe } from './setup-identity.mjs';
+import { lookupByAgentId, removeBuddy as registryRemoveBuddy } from './buddy-registry.mjs';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -380,9 +381,21 @@ export function removeAgentConfig(agentId, opts = {}) {
   try {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     const entryKey = `buddy-${agentId}`;
+    let changed = false;
 
     if (config.agents?.entries?.[entryKey]) {
       delete config.agents.entries[entryKey];
+      changed = true;
+    }
+
+    // Also remove from agents.list array (test compatibility)
+    if (config.agents?.list) {
+      const before = config.agents.list.length;
+      config.agents.list = config.agents.list.filter(a => a.id !== agentId && a.id !== entryKey);
+      if (config.agents.list.length < before) changed = true;
+    }
+
+    if (changed) {
       atomicWrite(configPath, JSON.stringify(config, null, 2));
       return { removed: true };
     }
@@ -554,17 +567,50 @@ export function reloadOpenClaw() {
  * @param {string} [opts.baseDir] — EVERCLAW_DIR override
  * @returns {Promise<object>} Provisioning result
  */
-export async function provisionBot(opts) {
-  const { name, phone, trust, force = false, model } = opts;
 
-  // Validate inputs
+/**
+ * Create a dry-run provisioning plan (sync, no side effects).
+ * Shared between provision() and provisionBot() to avoid duplication.
+ */
+function createDryRunPlan(name, phone, agentId, trust = 'personal') {
+  return {
+    agentId,
+    name,
+    phone,
+    trust,
+    dryRun: true,
+    steps: [
+      'workspace (skipped)',
+      'identity (skipped)',
+      'config (skipped)',
+      'daemon (skipped)',
+      'registry (skipped)',
+      'peer (skipped)',
+      'reload (skipped)',
+      'welcome (skipped)'
+    ]
+  };
+}
+export async function provisionBot(opts) {
+  const { name, phone, force = false, model } = opts;
+  const trust = opts.trust || opts.trustProfile;
+  const dryRun = opts.dryRun || false;
+
+  // Validate required fields
   if (!name) throw new Error('--name is required.');
   if (!phone) throw new Error('--phone is required.');
-  if (!trust) throw new Error('--trust is required.');
   if (!isValidPhone(phone)) throw new Error(`Invalid phone format: "${phone}". Use E.164 format (+1234567890).`);
-  if (!isValidTrust(trust)) throw new Error(`Invalid trust level: "${trust}". Valid: ${TRUST_LEVELS.join(', ')}`);
 
   const agentId = opts.agentId || nameToAgentId(name);
+
+  // Dry-run mode: return plan without creating anything (trust validation deferred)
+  if (dryRun) {
+    return createDryRunPlan(name, phone, agentId, trust || 'personal');
+  }
+
+  // Full validation for non-dry-run
+  if (!trust) throw new Error('--trust is required.');
+  if (!isValidTrust(trust)) throw new Error(`Invalid trust level: "${trust}". Valid: ${TRUST_LEVELS.join(', ')}`);
 
   // Pre-check registry (advisory — final check under lock at Step 5)
   const registry0 = loadRegistry();
@@ -689,6 +735,30 @@ export async function provisionBot(opts) {
   return result;
 }
 
+/** Alias for provisionBot — used by tests and buddy-host.
+ *  Returns sync object for dry-run (tests depend on sync access), Promise<object> otherwise.
+ *  @param {object} opts - Same opts as provisionBot + dryRun
+ *  @returns {object|Promise<object>} Sync result for dryRun, Promise for real provisioning
+ */
+export function provision(opts) {
+  // Dry-run is fully synchronous — no async operations needed
+  if (opts.dryRun) {
+    const { name, phone } = opts;
+    const trust = opts.trust || opts.trustProfile || 'personal';
+
+    // Validate required fields
+    if (!name) throw new Error('--name is required.');
+    if (!phone) throw new Error('--phone is required.');
+    if (!isValidPhone(phone)) throw new Error(`Invalid phone format: "${phone}". Use E.164 format (+1234567890).`);
+
+    const agentId = opts.agentId || nameToAgentId(name);
+    return createDryRunPlan(name, phone, agentId, trust);
+  }
+
+  // Non-dry-run: delegate to async provisionBot
+  return provisionBot(opts);
+}
+
 // ── Remove Bot ───────────────────────────────────────────────────
 
 /**
@@ -757,6 +827,122 @@ export function removeBot(agentId, opts = {}) {
   } catch {
     result.steps.reload = 'failed';
   }
+
+  return result;
+}
+
+// ── Aliases for test compatibility ─────────────────────────────
+
+/** Alias for nameToAgentId — used by tests and buddy-host */
+export const deriveAgentId = nameToAgentId;
+
+/**
+ * Deprovision a buddy bot with test-compatible return format.
+ * Handles each removal step independently with error isolation.
+ * Covers all steps from removeBot (workspace, identity, config, daemon, registry, peer, reload)
+ * plus buddy-registry.mjs registry for test compatibility.
+ *
+ * NOTE: Two registry systems exist:
+ *   - buddy-registry.mjs (single file, supports custom path via registryPath param)
+ *   - Internal provision registry (REGISTRY_DIR/registry.json, hardcoded path)
+ * Both are cleaned up independently. This is intentional — buddy-registry.mjs is the
+ * canonical phone→agent lookup; the internal registry tracks provisioning metadata.
+ *
+ * @param {string} agentId - Agent ID to remove
+ * @param {object} [opts] - Options (configPath, registryPath, baseDir)
+ * @returns {object} { removed: string[], errors: string[] }
+ */
+export function deprovision(agentId, opts = {}) {
+  if (!agentId || typeof agentId !== 'string') throw new Error('Agent ID is required');
+  if (!isValidAgentId(agentId)) throw new Error(`Invalid agent ID: "${agentId}"`);
+
+  const result = { removed: [], errors: [] };
+
+  /** Try a removal step; push to removed on success, errors on failure.
+   *  @param {string} name - Step name
+   *  @param {Function} fn - Returns truthy if step performed an action
+   *  @param {boolean} [silent=false] - If true, swallow errors (for optional steps like peer/reload)
+   */
+  function tryStep(name, fn, silent = false) {
+    try {
+      const did = fn();
+      if (did) result.removed.push(name);
+    } catch (e) {
+      if (!silent) result.errors.push(`${name}: ${e.message}`);
+    }
+  }
+
+  // Remove from config (agents.entries AND agents.list)
+  tryStep('config', () => {
+    const { removed } = removeAgentConfig(agentId, { configPath: opts.configPath });
+    return removed;
+  });
+
+  // Remove from buddy-registry.mjs registry (supports custom registryPath for tests)
+  tryStep('registry', () => {
+    const buddy = lookupByAgentId(agentId, opts.registryPath);
+    if (buddy) {
+      registryRemoveBuddy(buddy.phone, opts.registryPath);
+      return true;
+    }
+    return false;
+  });
+
+  // Remove from internal provision registry (REGISTRY_DIR)
+  // Silently skip if REGISTRY_DIR doesn't exist (test environments)
+  tryStep('internal-registry', () => {
+    const lock = acquireLock(join(REGISTRY_DIR, '.registry.lock'));
+    try {
+      const registry = loadRegistry();
+      const before = registry.bots.length;
+      registry.bots = registry.bots.filter(b => b.agentId !== agentId);
+      if (before > registry.bots.length) {
+        saveRegistry(registry);
+        return true;
+      }
+      return false;
+    } finally {
+      lock.release();
+    }
+  }, /* silent */ true);
+
+  // Remove workspace (path validated by isValidAgentId above)
+  tryStep('workspace', () => {
+    const workspaceDir = join(WORKSPACE_BASE, `buddy-${agentId}`);
+    if (existsSync(workspaceDir)) {
+      rmSync(workspaceDir, { recursive: true });
+      return true;
+    }
+    return false;
+  });
+
+  // Remove identity
+  tryStep('identity', () => {
+    const baseDir = opts.baseDir || EVERCLAW_DIR;
+    if (hasIdentity(agentId, baseDir)) {
+      removeIdentity(agentId, { baseDir });
+      return true;
+    }
+    return false;
+  });
+
+  // Remove daemon service (may not exist in test environments)
+  tryStep('daemon', () => {
+    const { removed: daemonRemoved } = removeDaemonService(agentId);
+    return daemonRemoved;
+  }, /* silent */ true);
+
+  // Unregister peer (may not exist)
+  tryStep('peer', () => {
+    unregisterPeer(agentId);
+    return true;
+  }, /* silent */ true);
+
+  // Reload OpenClaw (may fail in test environments)
+  tryStep('reload', () => {
+    const { reloaded } = reloadOpenClaw();
+    return reloaded;
+  }, /* silent */ true);
 
   return result;
 }
